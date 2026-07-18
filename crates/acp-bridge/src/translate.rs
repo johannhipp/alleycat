@@ -5,7 +5,7 @@ use serde_json::Value;
 /// Translate Codex InitializeParams to ACP InitializeRequest.
 pub fn codex_to_acp_initialize(codex_params: &Value) -> Result<Value, anyhow::Error> {
     let acp_request = serde_json::json!({
-        "protocolVersion": "1.0.0",
+        "protocolVersion": 1,
         "clientCapabilities": {
             "fs": {
                 "readTextFile": true,

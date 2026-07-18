@@ -16,7 +16,7 @@ fn test_codex_to_acp_initialize() {
     assert!(acp_request.is_ok());
 
     let acp_request = acp_request.unwrap();
-    assert_eq!(acp_request["protocolVersion"], "1.0.0");
+    assert_eq!(acp_request["protocolVersion"], 1);
     assert_eq!(acp_request["clientInfo"]["name"], "TestClient");
     assert_eq!(acp_request["clientInfo"]["version"], "1.0.0");
 }
