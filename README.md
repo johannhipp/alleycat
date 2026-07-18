@@ -94,7 +94,7 @@ or
 {"op": "connect", "v": 1, "token": "...", "agent": "codex"}
 ```
 
-The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `amp`, `opencode`, `claude`, `droid`, and `hermes`.
+The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `omp`, `amp`, `opencode`, `claude`, `droid`, and `hermes`.
 
 ## Configuration
 
@@ -114,6 +114,10 @@ port = 8390
 enabled = true
 bin = "pi"
 
+
+[agents.omp]
+enabled = true
+bin = "omp"           # Alleycat launches `omp acp`
 [agents.amp]
 enabled = true
 bin = "amp"
@@ -140,6 +144,7 @@ api_base = "http://127.0.0.1:8642"
 ```
 
 Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, Amp's `bin`/permission mode, OpenCode's `bin`/runtime port, Droid's `bin`, and Hermes's `bin`/`api_base` are pinned at first spawn; changing those requires `alleycat stop` + `serve`. Codex `host`/`port` are only used by the legacy websocket fallback. For Hermes API mode, bind the Hermes gateway to loopback and put `API_SERVER_KEY`/`HERMES_API_KEY` only in the Alleycat daemon environment; mobile clients authenticate through Alleycat pairing and never receive the Hermes key.
+OMP's `bin` is pinned at first bridge construction; changing it requires `alleycat stop` + `serve`.
 
 ## File layout
 

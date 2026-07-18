@@ -43,6 +43,7 @@ use crate::stream::IrohStream;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
+    Omp,
     Amp,
     Claude,
     Opencode,
@@ -203,6 +204,17 @@ impl AgentManager {
             .await
             .context("building droid bridge")?;
 
+        // OMP exposes its native Agent Client Protocol over stdio. Reuse
+        // Alleycat's generic ACP bridge instead of treating OMP as Pi RPC:
+        // OMP's RPC mode adds frames and commands that are not Pi-compatible.
+        let omp_bridge = AcpBridge::builder()
+            .agent_bin(PathBuf::from(&snapshot.agents.omp.bin))
+            .agent_args(vec!["acp".to_string()])
+            .launcher(Arc::clone(&launcher))
+            .build()
+            .await
+            .context("building omp bridge")?;
+
         let devin_builder = AcpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
             .launcher(Arc::clone(&launcher));
@@ -242,6 +254,7 @@ impl AgentManager {
 
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Omp, omp_bridge);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
@@ -338,6 +351,7 @@ impl AgentManager {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
                 "pi" => self.pi_available(&launch_env),
+                "omp" => self.omp_available(&launch_env),
                 "amp" => self.amp_available(&launch_env),
                 "opencode" => self.opencode_available(&launch_env),
                 "claude" => self.claude_available(&launch_env),
@@ -442,6 +456,7 @@ impl AgentManager {
         match name {
             "codex" => Some("codex"),
             "pi" => Some("pi"),
+            "omp" => Some("omp"),
             "amp" => Some("amp"),
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
@@ -459,6 +474,7 @@ impl AgentManager {
         match agent {
             "codex" => cfg.agents.codex.enabled,
             "pi" => cfg.agents.pi.enabled,
+            "omp" => cfg.agents.omp.enabled,
             "amp" => cfg.agents.amp.enabled,
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
@@ -943,6 +959,11 @@ impl AgentManager {
     fn pi_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin, env).is_some()
+    }
+
+    fn omp_available(&self, env: &LaunchEnvironment) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.omp.enabled && program_available(env, &cfg.agents.omp.bin)
     }
 
     fn opencode_available(&self, env: &LaunchEnvironment) -> bool {
@@ -1432,6 +1453,7 @@ fn resolve_pi_bin(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
     match name {
         "pi" => Some(AgentKind::Pi),
+        "omp" => Some(AgentKind::Omp),
         "amp" => Some(AgentKind::Amp),
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
@@ -1447,6 +1469,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
 fn agent_kind_str(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Pi => "pi",
+        AgentKind::Omp => "omp",
         AgentKind::Amp => "amp",
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
@@ -1462,6 +1485,7 @@ impl crate::config::AgentsConfig {
     fn is_enabled(&self, kind: AgentKind) -> bool {
         match kind {
             AgentKind::Pi => self.pi.enabled,
+            AgentKind::Omp => self.omp.enabled,
             AgentKind::Amp => self.amp.enabled,
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
