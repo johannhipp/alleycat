@@ -43,8 +43,11 @@ fn test_acp_to_codex_initialize_result() {
     assert!(codex_result.is_ok());
 
     let codex_result = codex_result.unwrap();
-    assert_eq!(codex_result["serverInfo"]["name"], "TestAgent");
-    assert_eq!(codex_result["serverInfo"]["version"], "2.0.0");
+    assert!(
+        codex_result["userAgent"]
+            .as_str()
+            .is_some_and(|value| value.contains("TestAgent 2.0.0"))
+    );
 }
 
 #[test]
