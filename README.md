@@ -33,6 +33,7 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 | `opencode` | See [opencode docs](https://opencode.ai). |
 | `amp` | Install Amp from [ampcode.com/install](https://ampcode.com/install), then either run `amp login` once or set `AMP_API_KEY` in the daemon environment. |
 | `pi` | See pi-mono docs. |
+| `omp` | Install [Oh My Pi](https://github.com/can1357/oh-my-pi): `curl -fsSL https://omp.sh/install | sh`, `brew install can1357/tap/omp`, or `bun install -g @oh-my-pi/pi-coding-agent`. |
 | `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
 | `droid` | Install Factory Droid, then either run `droid login` once or set `FACTORY_API_KEY` in the daemon environment. |
 | `hermes` | Install stock [Hermes Agent](https://github.com/NousResearch/hermes-agent). Alleycat prefers the Hermes gateway API on loopback and falls back to `hermes -z`; set `API_SERVER_KEY` or `HERMES_API_KEY` only in the daemon environment if your API server requires it. |
@@ -118,7 +119,7 @@ bin = "pi"
 
 [agents.omp]
 enabled = true
-bin = "omp"           # Alleycat launches `omp acp`
+bin = "omp"
 [agents.amp]
 enabled = true
 bin = "amp"
