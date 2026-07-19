@@ -64,6 +64,7 @@ fn main() {
             continue;
         };
 
+        let mut method_error: Option<(i64, String)> = None;
         let result = match method {
             "initialize" => json!({
                 "protocolVersion": 1,
@@ -125,7 +126,19 @@ fn main() {
                     })
                 }
             }
-            "session/load" => json!({ "configOptions": [] }),
+            "session/load" => {
+                let cwd = request
+                    .get("params")
+                    .and_then(|params| params.get("cwd"))
+                    .and_then(Value::as_str);
+                if cwd != Some(session_cwd.as_str()) {
+                    method_error = Some((
+                        -32602,
+                        format!("session/load cwd mismatch: expected {session_cwd}"),
+                    ));
+                }
+                json!({ "configOptions": [] })
+            }
             "session/prompt" => {
                 let prompt = request
                     .get("params")
@@ -145,7 +158,9 @@ fn main() {
             _ => json!({}),
         };
 
-        let frame = if prompt_error && method == "session/prompt" {
+        let frame = if let Some((code, message)) = method_error {
+            error_response(id, code, &message)
+        } else if prompt_error && method == "session/prompt" {
             error_response(id, -32603, "fake prompt failure")
         } else {
             response(id, result)

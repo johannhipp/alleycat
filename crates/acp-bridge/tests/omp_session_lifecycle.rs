@@ -152,6 +152,41 @@ async fn archive_deletes_omp_session_from_thread_list_after_reconnect() {
 }
 
 #[tokio::test]
+async fn resume_uses_authoritative_omp_session_cwd() {
+    let temp_dir = TempDir::new().expect("temporary test directory");
+    let cwd = temp_dir.path().to_string_lossy().to_string();
+    let (mut child, mut client) = spawn_bridge(temp_dir.path(), false, false, false, false).await;
+
+    initialize(&mut client).await;
+
+    let (start, _) = client
+        .request("thread/start", json!({ "cwd": &cwd }))
+        .await;
+    let thread_id = start["result"]["thread"]["id"]
+        .as_str()
+        .expect("thread/start session id");
+
+    let (listed, _) = client
+        .request("thread/list", json!({ "archived": false }))
+        .await;
+    assert_eq!(listed["result"]["data"][0]["cwd"], cwd);
+
+    let (resumed, _) = client
+        .request(
+            "thread/resume",
+            json!({ "threadId": thread_id, "cwd": "/" }),
+        )
+        .await;
+    assert!(
+        resumed["result"].is_object(),
+        "resume failed: {resumed}"
+    );
+    assert_eq!(resumed["result"]["cwd"], cwd);
+
+    child.kill().await.expect("stop bridge");
+    child.wait().await.expect("wait for bridge");
+}
+#[tokio::test]
 async fn archive_follows_omp_session_list_cursor() {
     let temp_dir = TempDir::new().expect("temporary test directory");
     let (mut child, mut client) = spawn_bridge(temp_dir.path(), true, true, false, false).await;

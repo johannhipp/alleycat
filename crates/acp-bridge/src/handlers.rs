@@ -440,6 +440,10 @@ pub async fn handle_thread_list(
                     let created_at = timestamp_ms(session.get("createdAt"));
                     let updated_at = timestamp_ms(session.get("updatedAt"));
 
+                    let cwd = session
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     Some(json!({
                         "id": session_id,
                         "sessionId": session_id,
@@ -451,7 +455,7 @@ pub async fn handle_thread_list(
                         "updatedAt": updated_at,
                         "status": { "type": "idle" },
                         "path": "",
-                        "cwd": "",
+                        "cwd": cwd,
                         "cliVersion": "",
                         "source": "appServer",
                         "threadSource": null,
@@ -516,16 +520,27 @@ pub async fn handle_thread_resume(
             data: None,
         })?;
 
+    // Resolve the authoritative ACP session cwd before loading. Mobile
+    // clients can omit it or send a fallback such as `/`; OMP rejects
+    // session/load unless the cwd matches the persisted session exactly.
+    let requested_cwd = typed.cwd.as_deref();
+    let cwd = match crate::bridge::find_session_cwd(client, &typed.thread_id).await {
+        Ok(Some(cwd)) => cwd,
+        Ok(None) => coerce_absolute_cwd(requested_cwd).to_owned(),
+        Err(error) => {
+            if let Some(cwd) = requested_cwd.filter(|cwd| cwd.starts_with('/')) {
+                cwd.to_owned()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+
     // ACP spec method is `session/load`, not `session/resume`. The agent
-    // advertises this via `agentCapabilities.loadSession: true`. `mcpServers`
-    // is required by ACP even when empty. `cwd` is also required as a
-    // string; mobile clients often call thread/resume without knowing the
-    // session's original cwd. Devin's serde tolerates `""`, but grok
-    // rejects relative paths with `-32602 Invalid params: Path is not
-    // absolute: `, so fall back to `/` when the client didn't supply one.
+    // advertises this via `agentCapabilities.loadSession: true`.
     let acp_request = json!({
         "sessionId": typed.thread_id,
-        "cwd": coerce_absolute_cwd(typed.cwd.as_deref()),
+        "cwd": &cwd,
         "mcpServers": [],
     });
 
@@ -579,7 +594,6 @@ pub async fn handle_thread_resume(
     // modelProvider / cwd / approvalPolicy / approvalsReviewer / sandbox.
     // Missing any one of these makes the iOS deserializer reject the whole
     // resume with `missing field <foo>`.
-    let cwd = typed.cwd.clone().unwrap_or_default();
     let model = typed.model.clone().unwrap_or_else(|| agent_id.clone());
     let model_provider = typed
         .model_provider

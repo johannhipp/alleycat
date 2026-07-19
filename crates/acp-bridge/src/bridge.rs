@@ -44,7 +44,7 @@ fn internal(msg: impl Into<String>) -> JsonRpcError {
 
 /// Find an ACP session's persisted working directory, following the
 /// pagination cursor returned by `session/list`.
-async fn find_session_cwd(
+pub(crate) async fn find_session_cwd(
     client: &Arc<crate::acp_client::AcpClient>,
     session_id: &str,
 ) -> Result<Option<String>, JsonRpcError> {
