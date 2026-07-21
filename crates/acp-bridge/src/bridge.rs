@@ -42,6 +42,55 @@ fn internal(msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+/// Find an ACP session's persisted working directory, following the
+/// pagination cursor returned by `session/list`.
+async fn find_session_cwd(
+    client: &Arc<crate::acp_client::AcpClient>,
+    session_id: &str,
+) -> Result<Option<String>, JsonRpcError> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let params = cursor
+            .as_deref()
+            .map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+        let response = client
+            .send_request("session/list", params)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let sessions = response
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| internal("ACP session/list response missing sessions"))?;
+
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        {
+            let cwd = session.get("cwd").and_then(Value::as_str).ok_or_else(|| {
+                invalid_params(format!("ACP session `{session_id}` is missing its cwd"))
+            })?;
+            if !PathBuf::from(cwd).is_absolute() {
+                return Err(invalid_params(format!(
+                    "ACP session `{session_id}` has a non-absolute cwd"
+                )));
+            }
+            return Ok(Some(cwd.to_owned()));
+        }
+
+        let Some(next_cursor) = response
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+        else {
+            return Ok(None);
+        };
+        if cursor.as_deref() == Some(next_cursor) {
+            return Err(internal("ACP session/list cursor did not advance"));
+        }
+        cursor = Some(next_cursor.to_owned());
+    }
+}
+
 /// One completed turn worth of state, stored in memory (and optionally
 /// persisted) so `thread/read` and `thread/resume` can return the full
 /// history without re-asking the upstream agent.
@@ -93,8 +142,9 @@ pub struct ModesSnapshot {
 /// Unified ACP bridge facade.
 pub struct AcpBridge {
     pool: Arc<AcpPool>,
-    /// All completed turns we've observed, keyed by codex thread/session
-    /// id. The list is ordered oldest→newest so `thread/read` can emit
+    /// Launcher shared by one-shot Codex command/exec requests. ACP agents
+    /// use the same launch environment as their pooled child process.
+    command_launcher: Arc<dyn ProcessLauncher>,
     /// turns in chronological order without re-sorting.
     turns: DashMap<String, Vec<StoredTurn>>,
     /// Session status per thread ID
@@ -118,6 +168,10 @@ pub struct AcpBridge {
     /// thread names are tracked locally and echoed back via
     /// `thread/name/updated` so iOS's display stays consistent.
     thread_titles: DashMap<String, String>,
+    /// Optional ACP prompt that permanently deletes a session. OMP needs
+    /// this because `session/close` only releases the live session record;
+    /// its `/session delete` command removes the persisted session file.
+    session_archive_prompt: Option<String>,
     /// Optional session persistence manager
     persistence: Option<SessionPersistence>,
     /// JoinHandle for the background pool-eviction task so we can abort
@@ -139,6 +193,10 @@ impl std::fmt::Debug for AcpBridge {
 impl AcpBridge {
     pub fn builder() -> AcpBridgeBuilder {
         AcpBridgeBuilder::default()
+    }
+
+    pub(crate) fn command_launcher(&self) -> Arc<dyn ProcessLauncher> {
+        Arc::clone(&self.command_launcher)
     }
 
     /// Ensure an ACP client exists for the given session, creating one if needed.
@@ -215,6 +273,78 @@ impl AcpBridge {
         }
 
         info!("Cleared turn history for session");
+    }
+
+    /// Delete an ACP session using the configured agent-specific strategy.
+    ///
+    /// ACP's generic `session/close` releases a live session but does not
+    /// promise removal from `session/list`. OMP's configured slash command
+    /// deletes its persisted session file. Agents without a configured
+    /// deletion strategy keep the prior METHOD_NOT_FOUND behavior.
+    pub async fn archive_session(
+        &self,
+        client: &Arc<crate::acp_client::AcpClient>,
+        session_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(prompt) = self.session_archive_prompt.as_deref() else {
+            return Err(JsonRpcError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: "thread/archive is not supported by this ACP agent".to_string(),
+                data: None,
+            });
+        };
+
+        let cwd = find_session_cwd(client, session_id)
+            .await?
+            .ok_or_else(|| invalid_params(format!("ACP session `{session_id}` was not found")))?;
+        client
+            .send_request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": [],
+                }),
+            )
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+
+        client
+            .send_request(
+                "session/prompt",
+                json!({
+                    "sessionId": session_id,
+                    "prompt": [{ "type": "text", "text": prompt }],
+                }),
+            )
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+
+        if find_session_cwd(client, session_id).await?.is_some() {
+            return Err(internal(format!(
+                "ACP session `{session_id}` remained after archive prompt"
+            )));
+        }
+
+        client
+            .send_request("session/close", json!({ "sessionId": session_id }))
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+
+        self.clear_session_state(session_id);
+        Ok(())
+    }
+
+    /// Clear every bridge-owned cache for a session.
+    #[instrument(skip(self), fields(session_id = %session_id))]
+    pub fn clear_session_state(&self, session_id: &str) {
+        self.clear_turns(session_id);
+        self.session_status.remove(session_id);
+        self.available_commands.remove(session_id);
+        self.models.remove(session_id);
+        self.modes.remove(session_id);
+        self.thread_titles.remove(session_id);
+        info!("Cleared bridge state for session");
     }
 
     /// Persist current turn history to disk if persistence is enabled.
@@ -442,6 +572,7 @@ pub struct AcpBridgeBuilder {
     retry_backoff: Option<Duration>,
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
+    session_archive_prompt: Option<String>,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -457,6 +588,7 @@ impl Default for AcpBridgeBuilder {
             retry_backoff: None,
             state_dir: None,
             enable_persistence: false,
+            session_archive_prompt: None,
         }
     }
 }
@@ -512,6 +644,12 @@ impl AcpBridgeBuilder {
         self
     }
 
+    /// Configure the ACP prompt used to permanently delete a session.
+    pub fn session_archive_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.session_archive_prompt = Some(prompt.into());
+        self
+    }
+
     /// Populate fields from environment variables. Reads:
     /// - `ACP_BRIDGE_AGENT_BIN` for the agent binary path
     /// - `ACP_BRIDGE_AGENT_ARGS` for the agent arguments (space-separated)
@@ -521,6 +659,8 @@ impl AcpBridgeBuilder {
     /// - `ACP_BRIDGE_REQUEST_TIMEOUT_SECS` for request timeout
     /// - `ACP_BRIDGE_MAX_RETRIES` for max retries
     /// - `ACP_BRIDGE_RETRY_BACKOFF_MS` for retry backoff
+    /// - `ACP_BRIDGE_SESSION_ARCHIVE_PROMPT` for the agent-specific
+    ///   prompt used to permanently delete a session
     ///
     /// Builder-set values stay; env vars only fill in fields the caller
     /// hasn't already set explicitly.
@@ -576,6 +716,13 @@ impl AcpBridgeBuilder {
                 }
             }
         }
+        if self.session_archive_prompt.is_none() {
+            if let Ok(prompt) = std::env::var("ACP_BRIDGE_SESSION_ARCHIVE_PROMPT") {
+                if !prompt.trim().is_empty() {
+                    self.session_archive_prompt = Some(prompt);
+                }
+            }
+        }
         self
     }
 
@@ -585,6 +732,7 @@ impl AcpBridgeBuilder {
         let launcher: Arc<dyn ProcessLauncher> = self
             .launcher
             .unwrap_or_else(|| Arc::new(LocalLauncher) as Arc<dyn ProcessLauncher>);
+        let command_launcher = Arc::clone(&launcher);
 
         let config = crate::config::AcpBridgeConfig {
             agent_bin,
@@ -645,12 +793,14 @@ impl AcpBridgeBuilder {
 
         Ok(Arc::new(AcpBridge {
             pool,
+            command_launcher,
             turns: DashMap::new(),
             session_status: DashMap::new(),
             available_commands: DashMap::new(),
             models: DashMap::new(),
             modes: DashMap::new(),
             thread_titles: DashMap::new(),
+            session_archive_prompt: self.session_archive_prompt,
             persistence,
             eviction_handle: std::sync::Mutex::new(Some(eviction_handle)),
         }))
@@ -682,10 +832,8 @@ impl Bridge for AcpBridge {
                 message: format!("Failed to create ACP client: {}", e),
                 data: None,
             })?;
-
         handlers::handle_initialize(&client, params).await
     }
-
     async fn dispatch(
         &self,
         ctx: &Conn,
@@ -778,7 +926,7 @@ impl Bridge for AcpBridge {
             }
             "thread/archive" => {
                 let typed: p::ThreadArchiveParams = decode(params)?;
-                handlers::handle_thread_archive(typed)
+                handlers::handle_thread_archive(ctx, self, &client, typed).await
             }
             "thread/unarchive" => {
                 let typed: p::ThreadUnarchiveParams = decode(params)?;

@@ -22,6 +22,10 @@ eula = false
 name = "alleycat-acp-bridge"
 path = "src/main.rs"
 
+[[bin]]
+name = "fake-omp-acp"
+path = "tests/support/fake_omp_acp.rs"
+
 [lib]
 name = "alleycat_acp_bridge"
 path = "src/lib.rs"

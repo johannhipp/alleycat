@@ -1,10 +1,17 @@
 //! Handlers for Codex protocol methods.
 
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use alleycat_bridge_core::{JsonRpcError, error_codes};
+use alleycat_bridge_core::{
+    ChildProcess, JsonRpcError, ProcessRole, ProcessSpec, StdioMode, error_codes,
+};
 use alleycat_codex_proto as p;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
+use tokio::time::timeout;
 use tracing::{info, instrument};
 
 use crate::acp_client::AcpClient;
@@ -972,6 +979,56 @@ pub fn handle_thread_name_set(
     p::ThreadSetNameResponse {}
 }
 
+fn finalize_failed_turn(
+    ctx: &alleycat_bridge_core::Conn,
+    bridge: &crate::bridge::AcpBridge,
+    thread_id: &str,
+    turn_id: &str,
+    user_item: Value,
+    started_at_ms: i64,
+    error_message: &str,
+) {
+    let completed_at_ms = chrono::Utc::now().timestamp_millis();
+    let error = json!({
+        "type": "internalError",
+        "message": error_message,
+    });
+    let items = vec![user_item];
+    let completed_turn = json!({
+        "id": turn_id,
+        "items": items.clone(),
+        "itemsView": "full",
+        "status": "failed",
+        "error": error,
+        "startedAt": started_at_ms / 1000,
+        "completedAt": completed_at_ms / 1000,
+        "durationMs": completed_at_ms - started_at_ms,
+    });
+
+    if ctx.should_emit("turn/completed") {
+        let _ = ctx.notifier().send_notification(
+            "turn/completed",
+            json!({
+                "threadId": thread_id,
+                "turn": completed_turn,
+            }),
+        );
+    }
+    bridge.set_session_status(ctx, thread_id, crate::bridge::SessionStatus::Idle);
+    bridge.append_turn(
+        thread_id,
+        crate::bridge::StoredTurn {
+            id: turn_id.to_string(),
+            items,
+            status: "failed".to_string(),
+            started_at_ms,
+            completed_at_ms: Some(completed_at_ms),
+            error: Some(error),
+        },
+    );
+}
+
+
 /// Handle turn/start request.
 ///
 /// Lifecycle:
@@ -1109,25 +1166,34 @@ pub async fn handle_turn_start(
     ));
     let emitter_cb = std::sync::Arc::clone(&emitter);
 
-    let acp_response = client
+    let acp_response = match client
         .send_request_streaming("session/prompt", acp_request, move |note| {
             if let Ok(mut e) = emitter_cb.lock() {
                 e.ingest(&note);
             }
         })
         .await
-        .map_err(|e| {
-            bridge.emit_thread_warning(
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("Failed to send session/prompt to ACP agent: {error}");
+            bridge.emit_thread_warning(ctx, &typed.thread_id, &message);
+            finalize_failed_turn(
                 ctx,
+                bridge,
                 &typed.thread_id,
-                &format!("Failed to send session/prompt to ACP agent: {}", e),
+                &stable_turn_id,
+                user_item.clone(),
+                turn_start_ms,
+                &message,
             );
-            JsonRpcError {
+            return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
-                message: format!("Failed to send session/prompt to ACP agent: {}", e),
+                message,
                 data: None,
-            }
-        })?;
+            });
+        }
+    };
 
     // Discard any notifications still in the fallback buffer — the
     // streaming subscriber already processed them.
@@ -1280,34 +1346,201 @@ pub async fn handle_turn_start(
     }))
 }
 
-/// Handle command/exec request.
+/// Handle a buffered command/exec request.
 ///
-/// codex `CommandExecParams` doesn't include a `threadId` field, so the
-/// bridge has no way to know which ACP session a shell command should
-/// run against (and ACP `terminal/*` methods require a session id). The
-/// previous implementation hard-coded `"default"`, hit "Session not
-/// found" on every call, then mapped that to a confusing
-/// METHOD_NOT_FOUND with a misleading "agent doesn't support terminal
-/// operations" message.
-///
-/// Surface a clear METHOD_NOT_FOUND up front. iOS shouldn't be calling
-/// command/exec on ACP threads anyway — tool execution from the agent
-/// flows through `session/update` → `tool_call`, which the translator
-/// already renders as `commandExecution` ThreadItems.
+/// ACP does not expose a session-independent terminal API, but Codex clients
+/// use buffered command/exec for host directory browsing and metadata probes.
+/// Run those argv commands through the bridge's configured launcher. Streaming
+/// stdout/stderr, PTYs, and stdin remain unsupported because they require
+/// connection-scoped process tracking and a terminal protocol.
 pub async fn handle_command_exec(
     _ctx: &alleycat_bridge_core::Conn,
-    _bridge: &crate::bridge::AcpBridge,
+    bridge: &crate::bridge::AcpBridge,
     _client: &Arc<AcpClient>,
-    _params: Value,
+    params: Value,
 ) -> Result<Value, JsonRpcError> {
-    Err(JsonRpcError {
-        code: error_codes::METHOD_NOT_FOUND,
-        message:
-            "command/exec is not supported by ACP bridges (no threadId in CommandExecParams). \
-                  Agent-initiated commands flow through session/update tool_call events instead."
-                .to_string(),
-        data: None,
+    let params: p::CommandExecParams = serde_json::from_value(params).map_err(|err| {
+        command_exec_error(error_codes::INVALID_PARAMS, format!("invalid command/exec params: {err}"))
+    })?;
+
+    if params.command.is_empty() {
+        return Err(command_exec_error(
+            error_codes::INVALID_PARAMS,
+            "command/exec requires a non-empty command argv",
+        ));
+    }
+    if params.tty {
+        return Err(command_exec_error(
+            error_codes::METHOD_NOT_FOUND,
+            "command/exec tty mode is not supported by ACP bridges",
+        ));
+    }
+    if params.stream_stdin {
+        return Err(command_exec_error(
+            error_codes::METHOD_NOT_FOUND,
+            "command/exec streamStdin is not supported by ACP bridges",
+        ));
+    }
+    if params.stream_stdout_stderr {
+        return Err(command_exec_error(
+            error_codes::METHOD_NOT_FOUND,
+            "command/exec streamStdoutStderr is not supported by ACP bridges",
+        ));
+    }
+    if params.disable_output_cap && params.output_bytes_cap.is_some() {
+        return Err(command_exec_error(
+            error_codes::INVALID_PARAMS,
+            "disableOutputCap cannot be combined with outputBytesCap",
+        ));
+    }
+    if params.disable_timeout && params.timeout_ms.is_some() {
+        return Err(command_exec_error(
+            error_codes::INVALID_PARAMS,
+            "disableTimeout cannot be combined with timeoutMs",
+        ));
+    }
+
+    let argv = params.command;
+    let env = params
+        .env
+        .as_ref()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_ref()
+                        .map(|value| (OsString::from(key), OsString::from(value)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = ProcessSpec {
+        role: ProcessRole::ToolCommand,
+        program: PathBuf::from(&argv[0]),
+        args: argv[1..].iter().map(OsString::from).collect(),
+        cwd: params.cwd,
+        env,
+        env_clear: false,
+        stdin: StdioMode::Null,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+    };
+    let child = bridge
+        .command_launcher()
+        .launch(spec)
+        .await
+        .map_err(|err| command_exec_error(error_codes::INTERNAL_ERROR, format!("failed to spawn command: {err}")))?;
+
+    let cap = if params.disable_output_cap {
+        usize::MAX
+    } else {
+        params.output_bytes_cap.unwrap_or(DEFAULT_COMMAND_OUTPUT_BYTES_CAP)
+    };
+    let timeout_duration = if params.disable_timeout {
+        None
+    } else {
+        let milliseconds = params.timeout_ms.unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS).max(0) as u64;
+        Some(Duration::from_millis(milliseconds))
+    };
+
+    let response = run_buffered_command(child, cap, timeout_duration).await?;
+    serde_json::to_value(response).map_err(|err| {
+        command_exec_error(
+            error_codes::INTERNAL_ERROR,
+            format!("failed to encode command/exec response: {err}"),
+        )
     })
+}
+
+const DEFAULT_COMMAND_OUTPUT_BYTES_CAP: usize = 256 * 1024;
+const DEFAULT_COMMAND_TIMEOUT_MS: i64 = 60_000;
+
+async fn run_buffered_command(
+    mut child: Box<dyn ChildProcess>,
+    cap: usize,
+    timeout_duration: Option<Duration>,
+) -> Result<p::CommandExecResponse, JsonRpcError> {
+    let mut stdout = child.take_stdout().ok_or_else(|| {
+        command_exec_error(error_codes::INTERNAL_ERROR, "command has no stdout pipe")
+    })?;
+    let mut stderr = child.take_stderr().ok_or_else(|| {
+        command_exec_error(error_codes::INTERNAL_ERROR, "command has no stderr pipe")
+    })?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        let _ = read_command_output(&mut stdout, &mut output, cap).await;
+        output
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = Vec::new();
+        let _ = read_command_output(&mut stderr, &mut output, cap).await;
+        output
+    });
+
+    let exit_status = match timeout_duration {
+        Some(duration) => match timeout(duration, child.wait()).await {
+            Ok(status) => status.map_err(|err| {
+                command_exec_error(
+                    error_codes::INTERNAL_ERROR,
+                    format!("failed waiting for command: {err}"),
+                )
+            })?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(command_exec_error(
+                    error_codes::INTERNAL_ERROR,
+                    "command/exec timed out",
+                ));
+            }
+        },
+        None => child.wait().await.map_err(|err| {
+            command_exec_error(
+                error_codes::INTERNAL_ERROR,
+                format!("failed waiting for command: {err}"),
+            )
+        })?,
+    };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    Ok(p::CommandExecResponse {
+        exit_code: exit_status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+async fn read_command_output<R>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+
+        let remaining = cap.saturating_sub(output.len());
+        let take = read.min(remaining);
+        output.extend_from_slice(&buffer[..take]);
+    }
+}
+
+fn command_exec_error(code: i64, message: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        code,
+        message: message.into(),
+        data: None,
+    }
 }
 
 /// Handle thread/fork request.
@@ -1400,13 +1633,18 @@ pub fn handle_thread_rollback(_params: p::ThreadRollbackParams) -> Result<Value,
 }
 
 /// Handle thread/archive request.
-pub fn handle_thread_archive(_params: p::ThreadArchiveParams) -> Result<Value, JsonRpcError> {
-    // ACP doesn't support archive, return an error
-    Err(JsonRpcError {
-        code: error_codes::METHOD_NOT_FOUND,
-        message: "thread/archive is not supported by ACP agents".to_string(),
-        data: None,
-    })
+pub async fn handle_thread_archive(
+    ctx: &alleycat_bridge_core::Conn,
+    bridge: &crate::bridge::AcpBridge,
+    client: &Arc<AcpClient>,
+    params: p::ThreadArchiveParams,
+) -> Result<Value, JsonRpcError> {
+    let thread_id = params.thread_id;
+    bridge.archive_session(client, &thread_id).await?;
+    let _ = ctx
+        .notifier()
+        .send_notification("thread/archived", json!({ "threadId": thread_id }));
+    Ok(json!({}))
 }
 
 /// Handle thread/unarchive request.
@@ -1531,3 +1769,39 @@ pub async fn handle_turn_interrupt(
 
 // Note: ACP `session/update` translation lives in `crate::translator`.
 // `handle_turn_start` and `build_turns_from_replay` are the only callers.
+
+#[cfg(test)]
+mod command_exec_tests {
+    use super::*;
+    use alleycat_bridge_core::{LocalLauncher, ProcessLauncher};
+
+    #[tokio::test]
+    async fn buffered_command_returns_stdout_stderr_and_exit_code() {
+        let launcher = LocalLauncher;
+        let child = launcher
+            .launch(ProcessSpec {
+                role: ProcessRole::ToolCommand,
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from("printf stdout; printf stderr >&2; exit 7"),
+                ],
+                cwd: None,
+                env: Vec::new(),
+                env_clear: false,
+                stdin: StdioMode::Null,
+                stdout: StdioMode::Piped,
+                stderr: StdioMode::Piped,
+            })
+            .await
+            .expect("spawn command");
+
+        let response = run_buffered_command(child, 1024, Some(Duration::from_secs(2)))
+            .await
+            .expect("buffered command");
+
+        assert_eq!(response.exit_code, 7);
+        assert_eq!(response.stdout, "stdout");
+        assert_eq!(response.stderr, "stderr");
+    }
+}

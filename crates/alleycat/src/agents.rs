@@ -211,6 +211,7 @@ impl AgentManager {
             .agent_bin(PathBuf::from(&snapshot.agents.omp.bin))
             .agent_args(vec!["acp".to_string()])
             .launcher(Arc::clone(&launcher))
+            .session_archive_prompt("/session delete")
             .build()
             .await
             .context("building omp bridge")?;

@@ -55,8 +55,8 @@ The bridge consists of several key components:
 - **Thread operations**:
   - `thread/fork` - implemented as session/new with fork semantics
   - `thread/rollback` - returns METHOD_NOT_FOUND (ACP limitation)
-  - `thread/archive` - returns METHOD_NOT_FOUND (ACP limitation)
-  - `thread/unarchive` - returns METHOD_NOT_FOUND (ACP limitation)
+  - `thread/archive` - OMP deletes the persisted session via its configured `/session delete` command; generic ACP agents return METHOD_NOT_FOUND
+  - `thread/unarchive` - returns METHOD_NOT_FOUND (ACP limitation; OMP deletion is permanent)
 - **Review operations**:
   - `review/start` - returns METHOD_NOT_FOUND (ACP limitation)
 - **Notification infrastructure**:
@@ -162,7 +162,7 @@ The bridge handles translation between Codex protocol methods and ACP protocol m
 | `command/exec` | `terminal/create` | 🚧 Stub implementation |
 | `thread/fork` | N/A | ❌ Skipped in conformance |
 | `thread/rollback` | N/A | ❌ Skipped in conformance |
-| `thread/archive` | N/A | ❌ Skipped in conformance |
+| `thread/archive` | OMP `/session delete` when configured; otherwise N/A | ⚠️ OMP integration only |
 | `thread/unarchive` | N/A | ❌ Skipped in conformance |
 
 ## Design Decisions
@@ -305,11 +305,11 @@ The ACP bridge has been updated to provide full method coverage for all Codex pr
 
 - **Implemented thread/fork**: Now creates a new ACP session with fork semantics
 - **Implemented command/exec variants**: Added stub implementations for command/exec/terminate, command/exec/write, and command/exec/resize
-- **Proper error handling**: thread/rollback, thread/archive, thread/unarchive, and review/start now return METHOD_NOT_FOUND errors (appropriate since these operations are not supported by the ACP protocol)
+- **Generic ACP error handling**: thread/rollback, thread/archive, thread/unarchive, and review/start return METHOD_NOT_FOUND when the agent has no corresponding ACP capability
+- **OMP archive integration**: OMP's `/session delete` command is opt-in through `session_archive_prompt`; the bridge verifies paginated `session/list` absence before closing, clearing state, and emitting `thread/archived`, and rejects consumed no-op commands
 - **Notification infrastructure**: Added notification channel support to ACP client for future streaming implementation
-- **Updated conformance configuration**: Removed implemented methods from the skipped methods list
 
-The bridge now has complete method coverage. Methods that return METHOD_NOT_FOUND do so because the underlying ACP protocol doesn't support these operations, which is the correct behavior for a protocol bridge.
+The bridge now has complete method coverage. Methods that return METHOD_NOT_FOUND do so when the underlying ACP agent has no corresponding capability or configured deletion strategy, which is the correct behavior for a protocol bridge.
 
 ## Implementation Notes
 
@@ -320,7 +320,7 @@ The ACP bridge gracefully handles several ACP protocol limitations:
 1. **No streaming stdin**: ACP terminals don't support streaming stdin, so `command/exec/write` returns METHOD_NOT_FOUND
 2. **No PTY support**: ACP doesn't have PTY support, so `command/exec/resize` returns METHOD_NOT_FOUND  
 3. **No session history**: ACP doesn't provide historical turn data natively, but the bridge overcomes this by maintaining local conversation state
-4. **No thread operations**: ACP doesn't support thread/rollback, thread/archive, thread/unarchive, or review/start
+4. **No generic archive/unarchive**: ACP has no portable session deletion or archival operation; the OMP integration uses its own `/session delete` command and cannot unarchive
 5. **Terminal capability required**: Command execution requires the ACP agent to support terminal capability
 
 These limitations are inherent to the ACP protocol design, which focuses on live session management rather than historical state or advanced terminal features. The bridge mitigates the session history limitation through local state management.
@@ -395,7 +395,8 @@ This ensures efficient resource usage while maintaining good performance for act
 The following features remain in the conformance skipped lists due to ACP protocol limitations:
 
 **Methods (ACP protocol limitations):**
-- `thread/rollback`, `thread/archive`, `thread/unarchive` - ACP doesn't support session management operations
+- `thread/rollback`, `thread/unarchive` - ACP doesn't support these operations
+- `thread/archive` - generic ACP agents don't expose deletion; the OMP-specific prompt strategy is outside shared conformance
 - `review/start` - ACP doesn't support code review operations
 - `command/exec/write` - ACP doesn't support streaming stdin
 - `command/exec/resize` - ACP doesn't support PTY resize operations

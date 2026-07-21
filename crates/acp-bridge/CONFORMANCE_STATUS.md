@@ -38,8 +38,8 @@ These methods are fully implemented and should pass conformance:
 
 **ACP-specific skipped methods:**
 - `thread/rollback` - ACP protocol doesn't support session rollback
-- `thread/archive` - ACP protocol doesn't support session archival
-- `thread/unarchive` - ACP protocol doesn't support session unarchival
+- `thread/archive` - generic ACP agents don't expose deletion; the OMP Alleycat integration opts into its `/session delete` command outside the shared conformance surface
+- `thread/unarchive` - ACP protocol doesn't support session unarchival; OMP deletion is permanent
 - `review/start` - ACP protocol doesn't support code review operations
 - `command/exec/write` - ACP doesn't support streaming stdin
 - `command/exec/resize` - ACP doesn't support PTY resize operations
